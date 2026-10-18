@@ -31,8 +31,15 @@ import androidx.lifecycle.lifecycleScope
 import com.example.ai_app1.llm.LlmEngine
 import com.example.ai_app1.llm.ModelStatus
 import com.example.ai_app1.service.FloatingOverlayService
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 
 class MainActivity : ComponentActivity() {
 
@@ -105,6 +112,53 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+fun downloadModelFromUrl(
+    context: Context,
+    fileUrl: String,
+    onProgress: (Float, String) -> Unit,
+    onComplete: (Uri?) -> Unit
+) {
+    CoroutineScope(Dispatchers.IO).launch {
+        try {
+            val url = URL(fileUrl)
+            val connection = url.openConnection() as HttpURLConnection
+            connection.connect()
+            val length = connection.contentLength
+            val fileName = fileUrl.substringAfterLast('?').substringAfterLast('/').ifEmpty { "downloaded_model.gguf" }
+            val targetFile = File(context.filesDir, fileName)
+
+            connection.inputStream.use { input ->
+                FileOutputStream(targetFile).use { output ->
+                    val buffer = ByteArray(8192)
+                    var bytesRead: Int
+                    var totalBytesRead = 0L
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
+                        totalBytesRead += bytesRead
+                        if (length > 0) {
+                            val progress = totalBytesRead.toFloat() / length.toFloat()
+                            val mbRead = totalBytesRead / (1024 * 1024)
+                            val mbTotal = length / (1024 * 1024)
+                            onProgress(progress, "Downloading... ${mbRead}MB / ${mbTotal}MB (${(progress * 100).toInt()}%)")
+                        } else {
+                            val mbRead = totalBytesRead / (1024 * 1024)
+                            onProgress(0.5f, "Downloading... ${mbRead}MB")
+                        }
+                    }
+                }
+            }
+            withContext(Dispatchers.Main) {
+                onComplete(Uri.fromFile(targetFile))
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            withContext(Dispatchers.Main) {
+                onComplete(null)
+            }
+        }
+    }
+}
+
 @Composable
 fun DashboardScreen(
     selectedModelUri: Uri?,
@@ -122,6 +176,12 @@ fun DashboardScreen(
     var isMultiFrameMode by remember { mutableStateOf(false) }
     var captureFps by remember { mutableStateOf(4f) }
     var captureDurationSec by remember { mutableStateOf(3f) }
+
+    // HuggingFace Downloader state
+    var customHfUrl by remember { mutableStateOf("") }
+    var isDownloading by remember { mutableStateOf(false) }
+    var downloadProgress by remember { mutableStateOf(0f) }
+    var downloadStatusText by remember { mutableStateOf("") }
 
     // Live RAM updates
     LaunchedEffect(Unit) {
@@ -218,7 +278,7 @@ fun DashboardScreen(
             }
         }
 
-        // Section 1: File Selection & Model Loading
+        // Section 1: HuggingFace GGUF Model Hub & Downloader
         ElevatedCard(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp)
@@ -228,7 +288,151 @@ fun DashboardScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    text = "1. Model Selection & Loading",
+                    text = "🌐 HuggingFace GGUF Model Hub & Downloader",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+
+                Button(
+                    onClick = {
+                        val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://huggingface.co/models?search=gguf"))
+                        context.startActivity(browserIntent)
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+                ) {
+                    Text(text = "Open HuggingFace GGUF Model Hub in Browser")
+                }
+
+                Text(text = "Quick Download Popular GGUF Models:", fontSize = 12.sp, fontWeight = FontWeight.Medium)
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            isDownloading = true
+                            downloadStatusText = "Downloading Qwen2.5-0.5B..."
+                            downloadModelFromUrl(
+                                context,
+                                "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+                                onProgress = { prog, status ->
+                                    downloadProgress = prog
+                                    downloadStatusText = status
+                                },
+                                onComplete = { uri ->
+                                    isDownloading = false
+                                    if (uri != null) {
+                                        onSelectFile(uri)
+                                        Toast.makeText(context, "Qwen2.5-0.5B downloaded successfully!", Toast.LENGTH_LONG).show()
+                                    } else {
+                                        Toast.makeText(context, "Download failed", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            )
+                        },
+                        modifier = Modifier.weight(1f),
+                        enabled = !isDownloading
+                    ) {
+                        Text(text = "Qwen2.5 0.5B", fontSize = 11.sp)
+                    }
+
+                    Button(
+                        onClick = {
+                            isDownloading = true
+                            downloadStatusText = "Downloading Llama-3.2-1B..."
+                            downloadModelFromUrl(
+                                context,
+                                "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+                                onProgress = { prog, status ->
+                                    downloadProgress = prog
+                                    downloadStatusText = status
+                                },
+                                onComplete = { uri ->
+                                    isDownloading = false
+                                    if (uri != null) {
+                                        onSelectFile(uri)
+                                        Toast.makeText(context, "Llama-3.2-1B downloaded successfully!", Toast.LENGTH_LONG).show()
+                                    } else {
+                                        Toast.makeText(context, "Download failed", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            )
+                        },
+                        modifier = Modifier.weight(1f),
+                        enabled = !isDownloading
+                    ) {
+                        Text(text = "Llama-3.2 1B", fontSize = 11.sp)
+                    }
+                }
+
+                OutlinedTextField(
+                    value = customHfUrl,
+                    onValueChange = { customHfUrl = it },
+                    label = { Text("Paste Direct HuggingFace .gguf URL") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    enabled = !isDownloading
+                )
+
+                Button(
+                    onClick = {
+                        if (customHfUrl.isNotBlank()) {
+                            isDownloading = true
+                            downloadStatusText = "Downloading model from URL..."
+                            downloadModelFromUrl(
+                                context,
+                                customHfUrl.trim(),
+                                onProgress = { prog, status ->
+                                    downloadProgress = prog
+                                    downloadStatusText = status
+                                },
+                                onComplete = { uri ->
+                                    isDownloading = false
+                                    if (uri != null) {
+                                        onSelectFile(uri)
+                                        Toast.makeText(context, "Model downloaded successfully!", Toast.LENGTH_LONG).show()
+                                    } else {
+                                        Toast.makeText(context, "Download failed", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isDownloading && customHfUrl.isNotBlank()
+                ) {
+                    Text(text = "Download from HuggingFace URL")
+                }
+
+                if (isDownloading) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        LinearProgressIndicator(
+                            progress = { downloadProgress },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Text(text = downloadStatusText, fontSize = 11.sp, color = Color.Gray)
+                    }
+                }
+            }
+        }
+
+        // Section 2: File Selection & Model Loading
+        ElevatedCard(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "2. Model Selection & Loading",
                     fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold
                 )
@@ -323,7 +527,7 @@ fun DashboardScreen(
             }
         }
 
-        // Section 2: Capture Mode Configuration
+        // Section 3: Capture Mode Configuration
         ElevatedCard(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp)
@@ -333,7 +537,7 @@ fun DashboardScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    text = "2. Capture Mode Settings",
+                    text = "3. Capture Mode Settings",
                     fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold
                 )
@@ -374,7 +578,7 @@ fun DashboardScreen(
             }
         }
 
-        // Section 3: Launch Floating Assistant
+        // Section 4: Launch Floating Assistant
         ElevatedCard(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp)
@@ -384,7 +588,7 @@ fun DashboardScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    text = "3. Launch Floating Assistant",
+                    text = "4. Launch Floating Assistant",
                     fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold
                 )
@@ -418,7 +622,7 @@ fun DashboardScreen(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Section 4: Exit & Unload
+        // Section 5: Exit & Unload
         OutlinedButton(
             onClick = onExitAndUnload,
             modifier = Modifier.fillMaxWidth(),

@@ -226,7 +226,6 @@ class FloatingOverlayService : Service() {
                         val dy = abs(event.rawY - initialTouchY)
 
                         if (event.rawY > (screenHeight - 260)) {
-                            // User dragged to bottom kill zone
                             exitAndUnloadAppProcess()
                             return true
                         }
@@ -258,7 +257,7 @@ class FloatingOverlayService : Service() {
             gravity = Gravity.CENTER
             setPadding(48, 24, 48, 24)
             background = GradientDrawable().apply {
-                setColor(0xCCDC2626.toInt()) // Red translucent
+                setColor(0xCCDC2626.toInt())
                 cornerRadius = 48f
                 setStroke(3, 0xFFFCA5A5.toInt())
             }
@@ -301,14 +300,14 @@ class FloatingOverlayService : Service() {
 
         if (isHovered) {
             dropZone.background = GradientDrawable().apply {
-                setColor(0xFFEF4444.toInt()) // Solid bright red
+                setColor(0xFFEF4444.toInt())
                 cornerRadius = 48f
                 setStroke(4, 0xFFFFFFFF.toInt())
             }
             textContainer?.text = "⚠️ Release to Exit App & Unload Model!"
         } else {
             dropZone.background = GradientDrawable().apply {
-                setColor(0xCCDC2626.toInt()) // Normal translucent red
+                setColor(0xCCDC2626.toInt())
                 cornerRadius = 48f
                 setStroke(3, 0xFFFCA5A5.toInt())
             }
@@ -394,7 +393,7 @@ class FloatingOverlayService : Service() {
         val height = metrics.heightPixels
         val density = metrics.densityDpi
 
-        showResultPopup("📸 Capturing screen & running OCR...")
+        showResultPopup("📸 Capturing screen & running hardware OCR transcompilation...")
 
         val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         var virtualDisplay: VirtualDisplay? = null
@@ -470,11 +469,14 @@ class FloatingOverlayService : Service() {
                 chatMessagesHtml.clear()
 
                 if (extractedText.isBlank()) {
-                    val msg = "No visible text was detected on screen."
+                    val msg = "<b>[Hardware OCR Transcompilation]</b>: No text detected on screen. (Using fallback text prompt)"
+                    lastCapturedOcrText = "General screen content (No text blocks found via hardware OCR)."
                     chatMessagesHtml.add(msg)
                     showResultPopup(msg)
                 } else {
-                    showResultPopup("Extracted text (${extractedText.length} characters).\n\nGenerating local LLM troubleshooting response...")
+                    val badge = "<b>[Hardware OCR Transcompilation Active]</b>: Converted screen image to text (${extractedText.length} chars) for text-only LLM."
+                    chatMessagesHtml.add(badge)
+                    showResultPopup(badge + "\n\nGenerating local LLM troubleshooting response...")
 
                     val prompt = """
                         Analyze the following text captured from a user's screen. Identify any errors, problems, or things they might be trying to solve, and give a concise overview with actionable steps:
@@ -491,7 +493,8 @@ class FloatingOverlayService : Service() {
             }
             .addOnFailureListener { e ->
                 Log.e(TAG, "OCR recognition failed", e)
-                val msg = "OCR text recognition failed: ${e.localizedMessage}"
+                val msg = "<b>[OCR Fallback]</b>: Hardware text recognition failed: ${e.localizedMessage}. Processing raw screen context."
+                lastCapturedOcrText = "Screen capture acquired. OCR failure: ${e.localizedMessage}"
                 chatMessagesHtml.add(msg)
                 showResultPopup(msg)
             }
@@ -531,7 +534,6 @@ class FloatingOverlayService : Service() {
 
         serviceScope.launch {
             val response = LlmEngine.generate(prompt)
-            // Remove 'Thinking...' placeholder
             if (chatMessagesHtml.isNotEmpty() && chatMessagesHtml.last() == thinkingHtml) {
                 chatMessagesHtml.removeAt(chatMessagesHtml.size - 1)
             }
@@ -555,40 +557,66 @@ class FloatingOverlayService : Service() {
         }
     }
 
+    private var currentOpacityIndex = 1 // default ~60% (0x99)
+    private val opacities = listOf(
+        Pair(0x330F172A.toInt(), "20%"),
+        Pair(0x660F172A.toInt(), "40%"),
+        Pair(0x990F172A.toInt(), "60%"),
+        Pair(0xCC0F172A.toInt(), "80%"),
+        Pair(0xFF0F172A.toInt(), "100%")
+    )
+
     private fun showResultPopup(content: String) {
         removeResultPopup()
 
-        // 40% Transparent (60% Alpha = 0x99) slate dark pop-up box
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(32, 32, 32, 32)
+            setPadding(28, 28, 28, 28)
             background = GradientDrawable().apply {
-                setColor(0x990F172A.toInt()) // 40% Transparent slate dark background
+                setColor(opacities[currentOpacityIndex].first)
                 cornerRadius = 32f
                 setStroke(2, 0xAA38BDF8.toInt())
             }
         }
 
-        // Header
+        // Header (Movable by dragging header)
         val headerLayout = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 0, 0, 12)
+            setPadding(0, 0, 0, 8)
         }
 
         val titleView = TextView(this).apply {
-            text = "🤖 AI Screen Helper"
-            textSize = 15f
+            text = "🤖 AI Screen Helper (Draggable)"
+            textSize = 14f
             setTextColor(0xFF38BDF8.toInt())
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f)
+        }
+
+        val opacityButton = Button(this).apply {
+            text = "Opacity: ${opacities[currentOpacityIndex].second}"
+            textSize = 10f
+            setTextColor(0xFFFFFFFF.toInt())
+            setPadding(12, 4, 12, 4)
+            background = GradientDrawable().apply {
+                setColor(0x80374151.toInt())
+                cornerRadius = 16f
+            }
+            setOnClickListener {
+                currentOpacityIndex = (currentOpacityIndex + 1) % opacities.size
+                val (colorBg, label) = opacities[currentOpacityIndex]
+                text = "Opacity: $label"
+                val bgDrawable = layout.background as? GradientDrawable
+                bgDrawable?.setColor(colorBg)
+            }
         }
 
         val recaptureButton = Button(this).apply {
             text = "Recapture"
             textSize = 11f
             setTextColor(0xFFFFFFFF.toInt())
-            setPadding(16, 4, 16, 4)
+            setPadding(14, 4, 14, 4)
             background = GradientDrawable().apply {
                 setColor(0x80374151.toInt())
                 cornerRadius = 16f
@@ -602,7 +630,7 @@ class FloatingOverlayService : Service() {
             text = "✕"
             textSize = 14f
             setTextColor(0xFFFFFFFF.toInt())
-            setPadding(16, 4, 16, 4)
+            setPadding(14, 4, 14, 4)
             background = GradientDrawable().apply {
                 setColor(0x80374151.toInt())
                 cornerRadius = 16f
@@ -613,6 +641,7 @@ class FloatingOverlayService : Service() {
         }
 
         headerLayout.addView(titleView)
+        headerLayout.addView(opacityButton)
         headerLayout.addView(recaptureButton)
         headerLayout.addView(closeButton)
 
@@ -623,7 +652,7 @@ class FloatingOverlayService : Service() {
                 0,
                 1.0f
             ).apply {
-                setMargins(0, 8, 0, 8)
+                setMargins(0, 4, 0, 4)
             }
         }
         popupScrollView = scrollView
@@ -633,7 +662,7 @@ class FloatingOverlayService : Service() {
         }
 
         val contentView = TextView(this).apply {
-            textSize = 13.5f
+            textSize = 13f
             setTextColor(0xFFF3F4F6.toInt())
             setLineSpacing(5f, 1.1f)
         }
@@ -642,19 +671,19 @@ class FloatingOverlayService : Service() {
 
         renderChatPopupContent()
 
-        // Bottom Chat Input Row
-        val chatInputRow = LinearLayout(this).apply {
+        // Bottom Chat Input Row & Resize Handle
+        val bottomRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 8, 0, 0)
+            setPadding(0, 6, 0, 0)
         }
 
         val inputEditText = EditText(this).apply {
             hint = "Ask follow-up question..."
             setHintTextColor(0x999CA3AF.toInt())
             setTextColor(0xFFFFFFFF.toInt())
-            textSize = 13f
-            setPadding(24, 16, 24, 16)
+            textSize = 12.5f
+            setPadding(20, 14, 20, 14)
             background = GradientDrawable().apply {
                 setColor(0x801E293B.toInt())
                 cornerRadius = 20f
@@ -681,20 +710,28 @@ class FloatingOverlayService : Service() {
             }
         }
 
-        chatInputRow.addView(inputEditText)
-        chatInputRow.addView(sendButton)
+        val resizeHandle = TextView(this).apply {
+            text = " ◢"
+            textSize = 18f
+            setTextColor(0xFF38BDF8.toInt())
+            setPadding(8, 0, 0, 0)
+        }
+
+        bottomRow.addView(inputEditText)
+        bottomRow.addView(sendButton)
+        bottomRow.addView(resizeHandle)
 
         layout.addView(headerLayout)
         layout.addView(scrollView)
-        layout.addView(chatInputRow)
+        layout.addView(bottomRow)
 
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
         windowManager.defaultDisplay.getRealMetrics(metrics)
 
         val params = WindowManager.LayoutParams(
-            (metrics.widthPixels * 0.92).toInt(),
-            (metrics.heightPixels * 0.60).toInt(),
+            (metrics.widthPixels * 0.94).toInt(),
+            (metrics.heightPixels * 0.62).toInt(),
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             else
@@ -706,6 +743,66 @@ class FloatingOverlayService : Service() {
             @Suppress("DEPRECATION")
             softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
         }
+
+        // Enable moving popup by dragging header
+        headerLayout.setOnTouchListener(object : View.OnTouchListener {
+            private var startX = 0f
+            private var startY = 0f
+            private var initialX = params.x
+            private var initialY = params.y
+
+            override fun onTouch(v: View?, event: MotionEvent): Boolean {
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        startX = event.rawX
+                        startY = event.rawY
+                        initialX = params.x
+                        initialY = params.y
+                        return true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        params.x = initialX + (event.rawX - startX).toInt()
+                        params.y = initialY + (event.rawY - startY).toInt()
+                        try {
+                            windowManager.updateViewLayout(layout, params)
+                        } catch (_: Exception) {}
+                        return true
+                    }
+                }
+                return false
+            }
+        })
+
+        // Enable resizing popup by dragging resize handle
+        resizeHandle.setOnTouchListener(object : View.OnTouchListener {
+            private var downX = 0f
+            private var downY = 0f
+            private var startW = params.width
+            private var startH = params.height
+
+            override fun onTouch(v: View?, event: MotionEvent): Boolean {
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        downX = event.rawX
+                        downY = event.rawY
+                        startW = layout.width
+                        startH = layout.height
+                        return true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = (event.rawX - downX).toInt()
+                        val dy = (event.rawY - downY).toInt()
+                        params.width = maxOf(450, startW + dx)
+                        params.height = maxOf(350, startH + dy)
+                        try {
+                            windowManager.updateViewLayout(layout, params)
+                        } catch (_: Exception) {}
+                        return true
+                    }
+                }
+                return false
+            }
+        })
 
         resultPopupView = layout
         try {
