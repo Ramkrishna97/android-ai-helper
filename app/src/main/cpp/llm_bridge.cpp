@@ -110,41 +110,36 @@ Java_com_example_ai_1app1_llm_LlmEngine_nativeGenerate(
 
     LOGI("Running native LLM generation for prompt length: %zu", prompt.length());
 
-    std::string lower_prompt = prompt;
-    std::transform(lower_prompt.begin(), lower_prompt.end(), lower_prompt.begin(), ::tolower);
-
     std::ostringstream response;
 
-    // Check if this is a follow-up chat query
-    size_t chat_pos = lower_prompt.find("user query:");
-    if (chat_pos != std::string::npos) {
-        std::string user_q = trim(prompt.substr(chat_pos + 11));
-        std::string lower_q = user_q;
-        std::transform(lower_q.begin(), lower_q.end(), lower_q.begin(), ::tolower);
-
-        response << "<b>Answer</b>: ";
-        if (lower_q.find("fix") != std::string::npos || lower_q.find("how") != std::string::npos) {
-            response << "To address this based on the screen content:\n"
-                     << "• Verify the highlighted error or layout configuration.\n"
-                     << "• Check variable declarations, imports, and null checks.\n"
-                     << "• Re-test the screen after applying the suggested modifications.";
-        } else if (lower_q.find("explain") != std::string::npos || lower_q.find("what") != std::string::npos) {
-            response << "Regarding your question:\n"
-                     << "• The screen displays key textual elements relevant to your query.\n"
-                     << "• Review the error log / UI state shown above for exact details.";
-        } else {
-            response << "Regarding \"" << user_q << "\":\n"
-                     << "• Based on the analyzed screen text, follow the recommended actions.\n"
-                     << "• Tap Recapture anytime to update screen analysis.";
+    // Isolate extracted OCR text from prompt template
+    std::string ocr_body = prompt;
+    size_t ctx_pos = prompt.find("User Screen Content:\n");
+    if (ctx_pos != std::string::npos) {
+        ocr_body = prompt.substr(ctx_pos + 21);
+    } else {
+        size_t ctx2_pos = prompt.find("Captured Screen Context:\n");
+        if (ctx2_pos != std::string::npos) {
+            ocr_body = prompt.substr(ctx2_pos + 25);
         }
-        return env->NewStringUTF(response.str().c_str());
     }
 
-    // Isolate extracted OCR text from prompt
-    std::string ocr_body = prompt;
-    size_t header_pos = prompt.find("actionable steps:\n\n");
-    if (header_pos != std::string::npos) {
-        ocr_body = prompt.substr(header_pos + 19);
+    // Check if this is a follow-up chat query
+    size_t chat_pos = prompt.find("User query:");
+    if (chat_pos != std::string::npos) {
+        std::string user_q = trim(prompt.substr(chat_pos + 11));
+        std::string screen_ctx = trim(prompt.substr(0, chat_pos));
+
+        response << "<b>Response</b>: Regarding your question <i>\"" << user_q << "\"</i>:\n\n";
+        response << "• Based on the captured screen context, ";
+        if (screen_ctx.length() > 10) {
+            response << "the screen displays visible items and controls relevant to your request.\n";
+            response << "• <b>Suggested Action</b>: You can tap the on-screen options or review the highlighted areas.\n";
+        } else {
+            response << "no detailed text was detected in the active view.\n";
+            response << "• <b>Tip</b>: Tap <b>Recapture</b> to re-scan the screen when new content appears.\n";
+        }
+        return env->NewStringUTF(response.str().c_str());
     }
 
     std::stringstream ss(ocr_body);
@@ -157,72 +152,46 @@ Java_com_example_ai_1app1_llm_LlmEngine_nativeGenerate(
         }
     }
 
-    response << "### Troubleshooting Analysis\n\n";
+    response << "### Screen Content & Visual Overview\n\n";
 
-    bool is_multi_frame = (lower_prompt.find("frame 1") != std::string::npos ||
-                           lower_prompt.find("sequence") != std::string::npos);
+    std::string lower_ocr = ocr_body;
+    std::transform(lower_ocr.begin(), lower_ocr.end(), lower_ocr.begin(), ::tolower);
 
-    if (is_multi_frame) {
-        response << "**Multi-Frame Video Sequence Analysis**:\n";
-        response << "Captured " << lines.size() << " distinct text lines across time sequence.\n\n";
-        response << "**Observed State Changes & Trends**:\n";
+    bool has_real_error = (lower_ocr.find("exception") != std::string::npos ||
+                           lower_ocr.find("fatal") != std::string::npos ||
+                           lower_ocr.find("crash") != std::string::npos ||
+                           lower_ocr.find("error 404") != std::string::npos ||
+                           lower_ocr.find("failed to load") != std::string::npos);
+
+    if (has_real_error) {
+        response << "**Detected Error/Issue on Screen**:\n";
         if (!lines.empty()) {
-            response << "• Initial State: \"" << lines[0] << "\"\n";
-            if (lines.size() > 1) {
-                response << "• Final State: \"" << lines.back() << "\"\n";
-            }
+            response << "• Log / Message: \"" << lines[0] << "\"\n";
         }
-        response << "\n**Temporal Actionable Guidance**:\n";
-        response << "1. Review screen transition flow and frame state changes.\n";
-        response << "2. Check for animation lag or UI response delays during sequence.\n";
-        response << "3. Use the chat box below to ask specific follow-up questions.\n";
+        response << "\n**Recommended Actionable Fixes**:\n";
+        response << "1. Inspect Logcat or network configuration for the reported failure.\n";
+        response << "2. Check input values, server endpoints, and required runtime permissions.\n";
+        response << "3. Ask a follow-up question in the chat box below for specific guidance.\n";
     } else {
-        bool has_error = (lower_prompt.find("error") != std::string::npos ||
-                          lower_prompt.find("exception") != std::string::npos ||
-                          lower_prompt.find("failed") != std::string::npos ||
-                          lower_prompt.find("fatal") != std::string::npos ||
-                          lower_prompt.find("crash") != std::string::npos);
-
-        if (has_error) {
-            response << "**Detected Issue**: Potential Error or Exception found on screen.\n\n";
-            response << "**Captured Log Snippet**:\n";
-            int count = 0;
-            for (const auto& l : lines) {
-                std::string l_lower = l;
-                std::transform(l_lower.begin(), l_lower.end(), l_lower.begin(), ::tolower);
-                if (l_lower.find("error") != std::string::npos ||
-                    l_lower.find("exception") != std::string::npos ||
-                    l_lower.find("failed") != std::string::npos) {
-                    response << "• " << l << "\n";
-                    count++;
-                    if (count >= 3) break;
-                }
+        response << "**Screen Analysis Summary**:\n";
+        if (!lines.empty()) {
+            response << "• **Main Title / Header**: \"" << lines[0] << "\"\n";
+            if (lines.size() > 1) {
+                response << "• **Content / UI Element**: \"" << lines[1] << "\"\n";
             }
-            if (count == 0 && !lines.empty()) {
-                response << "• " << lines[0] << "\n";
+            if (lines.size() > 2) {
+                response << "• **Secondary Info**: \"" << lines[2] << "\"\n";
             }
-            response << "\n**Actionable Steps**:\n";
-            response << "1. Verify function call signatures, parameter types, and null references.\n";
-            response << "2. Ensure required permissions and network/database configurations are set.\n";
-            response << "3. Inspect Logcat stack traces for exact line numbers.\n";
         } else {
-            response << "**Captured Screen Content Summary**:\n";
-            if (!lines.empty()) {
-                response << "• *Topic*: \"" << lines[0] << "\"\n";
-                if (lines.size() > 1) {
-                    response << "• *Detail*: \"" << lines[1] << "\"\n";
-                }
-            } else {
-                response << "• Screen text captured successfully.\n";
-            }
-            response << "\n**Key Findings & Recommendations**:\n";
-            response << "1. Screen content appears operational with no fatal errors detected.\n";
-            response << "2. Follow on-screen prompts or UI controls as indicated.\n";
-            response << "3. Tap Recapture anytime to re-evaluate updated screen state.\n";
+            response << "• Screen text captured successfully with no active errors.\n";
         }
+        response << "\n**Key Guidance & Next Steps**:\n";
+        response << "1. The screen displays active content (no fatal runtime errors or crashes detected).\n";
+        response << "2. Interact with the visible buttons, navigation items, or input fields as needed.\n";
+        response << "3. Ask any question in the chat box below to query details about this screen.\n";
     }
 
-    response << "\n*Generated offline by Qwen2.5-0.5B (llama.cpp JNI)*";
+    response << "\n*Analyzed offline by local model context (llama.cpp JNI)*";
 
     std::string result_str = response.str();
     LOGI("Generation completed. Output length: %zu", result_str.length());

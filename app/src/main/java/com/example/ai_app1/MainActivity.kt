@@ -27,6 +27,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.lifecycleScope
 import com.example.ai_app1.llm.LlmEngine
 import com.example.ai_app1.llm.ModelStatus
@@ -38,6 +39,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -115,6 +117,7 @@ class MainActivity : ComponentActivity() {
 fun downloadModelFromUrl(
     context: Context,
     fileUrl: String,
+    customFolderUri: Uri?,
     onProgress: (Float, String) -> Unit,
     onComplete: (Uri?) -> Unit
 ) {
@@ -124,11 +127,27 @@ fun downloadModelFromUrl(
             val connection = url.openConnection() as HttpURLConnection
             connection.connect()
             val length = connection.contentLength
-            val fileName = fileUrl.substringAfterLast('?').substringAfterLast('/').ifEmpty { "downloaded_model.gguf" }
-            val targetFile = File(context.filesDir, fileName)
+            val rawName = fileUrl.substringAfterLast('?').substringAfterLast('/')
+            val fileName = if (rawName.endsWith(".gguf", ignoreCase = true)) rawName else "$rawName.gguf"
+
+            val outputStream: OutputStream
+            val resultUri: Uri
+
+            if (customFolderUri != null) {
+                val docDir = DocumentFile.fromTreeUri(context, customFolderUri)
+                val docFile = docDir?.createFile("application/octet-stream", fileName)
+                    ?: throw java.io.IOException("Could not create file in selected folder")
+                outputStream = context.contentResolver.openOutputStream(docFile.uri)
+                    ?: throw java.io.IOException("Could not open output stream")
+                resultUri = docFile.uri
+            } else {
+                val targetFile = File(context.filesDir, fileName)
+                outputStream = FileOutputStream(targetFile)
+                resultUri = Uri.fromFile(targetFile)
+            }
 
             connection.inputStream.use { input ->
-                FileOutputStream(targetFile).use { output ->
+                outputStream.use { output ->
                     val buffer = ByteArray(8192)
                     var bytesRead: Int
                     var totalBytesRead = 0L
@@ -148,7 +167,7 @@ fun downloadModelFromUrl(
                 }
             }
             withContext(Dispatchers.Main) {
-                onComplete(Uri.fromFile(targetFile))
+                onComplete(resultUri)
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -177,7 +196,8 @@ fun DashboardScreen(
     var captureFps by remember { mutableStateOf(4f) }
     var captureDurationSec by remember { mutableStateOf(3f) }
 
-    // HuggingFace Downloader state
+    // HuggingFace Downloader & Storage Folder state
+    var customFolderUri by remember { mutableStateOf<Uri?>(null) }
     var customHfUrl by remember { mutableStateOf("") }
     var isDownloading by remember { mutableStateOf(false) }
     var downloadProgress by remember { mutableStateOf(0f) }
@@ -196,6 +216,21 @@ fun DashboardScreen(
     ) { uri: Uri? ->
         if (uri != null) {
             onSelectFile(uri)
+        }
+    }
+
+    val folderPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (_: Exception) {}
+            customFolderUri = uri
+            Toast.makeText(context, "Download folder selected!", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -246,7 +281,7 @@ fun DashboardScreen(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Offline OCR & Qwen2.5-0.5B Floating Assistant",
+                    text = "Offline Multimodal Vision & Screen Helper",
                     fontSize = 12.sp,
                     textAlign = TextAlign.Center,
                     color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)
@@ -278,7 +313,7 @@ fun DashboardScreen(
             }
         }
 
-        // Section 1: HuggingFace GGUF Model Hub & Downloader
+        // Section 1: HuggingFace GGUF Model Hub & Download Folder Chooser
         ElevatedCard(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp)
@@ -288,83 +323,166 @@ fun DashboardScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    text = "🌐 HuggingFace GGUF Model Hub & Downloader",
+                    text = "🌐 HuggingFace Vision Models (<2GB) & Downloader",
                     fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.primary
                 )
 
+                // Select Download Location Button
+                OutlinedButton(
+                    onClick = { folderPickerLauncher.launch(null) },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(text = if (customFolderUri != null) "📁 Location: ${customFolderUri?.lastPathSegment}" else "📂 Select Download Storage Folder")
+                }
+
                 Button(
                     onClick = {
-                        val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://huggingface.co/models?search=gguf"))
+                        val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://huggingface.co/models?pipeline_tag=image-text-to-text&sort=trending"))
                         context.startActivity(browserIntent)
                     },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
                 ) {
-                    Text(text = "Open HuggingFace GGUF Model Hub in Browser")
+                    Text(text = "Browse HuggingFace Vision Models in Browser")
                 }
 
-                Text(text = "Quick Download Popular GGUF Models:", fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                Text(
+                    text = "Featured Multimodal Vision Models (<2GB):",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
 
-                Row(
+                // Model 1: Moondream2 1.6B (~820MB)
+                Card(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
                 ) {
-                    Button(
-                        onClick = {
-                            isDownloading = true
-                            downloadStatusText = "Downloading Qwen2.5-0.5B..."
-                            downloadModelFromUrl(
-                                context,
-                                "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf",
-                                onProgress = { prog, status ->
-                                    downloadProgress = prog
-                                    downloadStatusText = status
-                                },
-                                onComplete = { uri ->
-                                    isDownloading = false
-                                    if (uri != null) {
-                                        onSelectFile(uri)
-                                        Toast.makeText(context, "Qwen2.5-0.5B downloaded successfully!", Toast.LENGTH_LONG).show()
-                                    } else {
-                                        Toast.makeText(context, "Download failed", Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                            )
-                        },
-                        modifier = Modifier.weight(1f),
-                        enabled = !isDownloading
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        Text(text = "Qwen2.5 0.5B", fontSize = 11.sp)
-                    }
+                        Text(text = "👁️ Moondream2 1.6B Vision (Q4 GGUF)", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        Text(text = "Size: ~820 MB | Optimized for mobile screenshot analysis & visual Q&A.", fontSize = 11.sp, color = Color.Gray)
+                        Text(text = "HuggingFace: vikhyatk/moondream2", fontSize = 10.sp, color = MaterialTheme.colorScheme.primary)
 
-                    Button(
-                        onClick = {
-                            isDownloading = true
-                            downloadStatusText = "Downloading Llama-3.2-1B..."
-                            downloadModelFromUrl(
-                                context,
-                                "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
-                                onProgress = { prog, status ->
-                                    downloadProgress = prog
-                                    downloadStatusText = status
-                                },
-                                onComplete = { uri ->
-                                    isDownloading = false
-                                    if (uri != null) {
-                                        onSelectFile(uri)
-                                        Toast.makeText(context, "Llama-3.2-1B downloaded successfully!", Toast.LENGTH_LONG).show()
-                                    } else {
-                                        Toast.makeText(context, "Download failed", Toast.LENGTH_SHORT).show()
+                        Button(
+                            onClick = {
+                                isDownloading = true
+                                downloadStatusText = "Downloading Moondream2 Vision..."
+                                downloadModelFromUrl(
+                                    context = context,
+                                    fileUrl = "https://huggingface.co/vikhyatk/moondream2/resolve/main/moondream2-q4.gguf",
+                                    customFolderUri = customFolderUri,
+                                    onProgress = { prog, status ->
+                                        downloadProgress = prog
+                                        downloadStatusText = status
+                                    },
+                                    onComplete = { uri ->
+                                        isDownloading = false
+                                        if (uri != null) {
+                                            onSelectFile(uri)
+                                            Toast.makeText(context, "Moondream2 Vision downloaded successfully!", Toast.LENGTH_LONG).show()
+                                        } else {
+                                            Toast.makeText(context, "Download failed", Toast.LENGTH_SHORT).show()
+                                        }
                                     }
-                                }
-                            )
-                        },
-                        modifier = Modifier.weight(1f),
-                        enabled = !isDownloading
+                                )
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !isDownloading
+                        ) {
+                            Text(text = "Download Moondream2 (~820MB)", fontSize = 11.sp)
+                        }
+                    }
+                }
+
+                // Model 2: Qwen2-VL-2B-Instruct (~1.6GB)
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        Text(text = "Llama-3.2 1B", fontSize = 11.sp)
+                        Text(text = "👁️ Qwen2-VL-2B-Instruct (Q4_K_M GGUF)", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        Text(text = "Size: ~1.6 GB | Alibaba's top 2B multimodal model for UI & screenshot OCR.", fontSize = 11.sp, color = Color.Gray)
+                        Text(text = "HuggingFace: bartowski/Qwen2-VL-2B-Instruct-GGUF", fontSize = 10.sp, color = MaterialTheme.colorScheme.primary)
+
+                        Button(
+                            onClick = {
+                                isDownloading = true
+                                downloadStatusText = "Downloading Qwen2-VL-2B..."
+                                downloadModelFromUrl(
+                                    context = context,
+                                    fileUrl = "https://huggingface.co/bartowski/Qwen2-VL-2B-Instruct-GGUF/resolve/main/Qwen2-VL-2B-Instruct-Q4_K_M.gguf",
+                                    customFolderUri = customFolderUri,
+                                    onProgress = { prog, status ->
+                                        downloadProgress = prog
+                                        downloadStatusText = status
+                                    },
+                                    onComplete = { uri ->
+                                        isDownloading = false
+                                        if (uri != null) {
+                                            onSelectFile(uri)
+                                            Toast.makeText(context, "Qwen2-VL-2B downloaded successfully!", Toast.LENGTH_LONG).show()
+                                        } else {
+                                            Toast.makeText(context, "Download failed", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                )
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !isDownloading
+                        ) {
+                            Text(text = "Download Qwen2-VL-2B (~1.6GB)", fontSize = 11.sp)
+                        }
+                    }
+                }
+
+                // Model 3: MiniCPM-V-2_6 2B Vision (~1.8GB)
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(text = "👁️ MiniCPM-V-2_6 2B Vision (Q4 GGUF)", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        Text(text = "Size: ~1.8 GB | Edge vision-language model for on-device screen analysis.", fontSize = 11.sp, color = Color.Gray)
+                        Text(text = "HuggingFace: openbmb/MiniCPM-V-2_6-gguf", fontSize = 10.sp, color = MaterialTheme.colorScheme.primary)
+
+                        Button(
+                            onClick = {
+                                isDownloading = true
+                                downloadStatusText = "Downloading MiniCPM-V-2_6..."
+                                downloadModelFromUrl(
+                                    context = context,
+                                    fileUrl = "https://huggingface.co/openbmb/MiniCPM-V-2_6-gguf/resolve/main/ggml-model-Q4_K_M.gguf",
+                                    customFolderUri = customFolderUri,
+                                    onProgress = { prog, status ->
+                                        downloadProgress = prog
+                                        downloadStatusText = status
+                                    },
+                                    onComplete = { uri ->
+                                        isDownloading = false
+                                        if (uri != null) {
+                                            onSelectFile(uri)
+                                            Toast.makeText(context, "MiniCPM-V downloaded successfully!", Toast.LENGTH_LONG).show()
+                                        } else {
+                                            Toast.makeText(context, "Download failed", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                )
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !isDownloading
+                        ) {
+                            Text(text = "Download MiniCPM-V (~1.8GB)", fontSize = 11.sp)
+                        }
                     }
                 }
 
@@ -381,10 +499,11 @@ fun DashboardScreen(
                     onClick = {
                         if (customHfUrl.isNotBlank()) {
                             isDownloading = true
-                            downloadStatusText = "Downloading model from URL..."
+                            downloadStatusText = "Downloading model from custom URL..."
                             downloadModelFromUrl(
-                                context,
-                                customHfUrl.trim(),
+                                context = context,
+                                fileUrl = customHfUrl.trim(),
+                                customFolderUri = customFolderUri,
                                 onProgress = { prog, status ->
                                     downloadProgress = prog
                                     downloadStatusText = status
