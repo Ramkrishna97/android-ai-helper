@@ -14,12 +14,19 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 
 data class RamInfo(
     val totalGb: Double,
     val availGb: Double,
     val appUsedMb: Double
 )
+
+enum class LlmEngineType {
+    GGUF_NATIVE,
+    OLLAMA_HTTP
+}
 
 sealed class ModelStatus {
     object Unloaded : ModelStatus()
@@ -56,6 +63,12 @@ object LlmEngine {
     private val _status = MutableStateFlow<ModelStatus>(ModelStatus.Unloaded)
     val status: StateFlow<ModelStatus> = _status.asStateFlow()
 
+    // Engine Configuration & Context Length
+    var engineType: LlmEngineType = LlmEngineType.GGUF_NATIVE
+    var ollamaHost: String = "http://127.0.0.1:11434"
+    var ollamaModelName: String = "gemma3:1b"
+    var contextLengthTokens: Int = 4096
+
     fun getSystemRamInfo(context: Context): RamInfo {
         val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val memoryInfo = ActivityManager.MemoryInfo()
@@ -78,7 +91,6 @@ object LlmEngine {
             val beforeRam = ramBefore ?: getSystemRamInfo(context)
 
             try {
-                // Copy file to internal cache so C++ native layer can read it via file path
                 val cachedFile = copyUriToCache(context, uri, fileName)
                 val filePath = cachedFile.absolutePath
                 val fileSizeMb = cachedFile.length().toDouble() / (1024.0 * 1024.0)
@@ -112,17 +124,132 @@ object LlmEngine {
     }
 
     suspend fun generate(prompt: String): String = withContext(Dispatchers.IO) {
+        if (engineType == LlmEngineType.OLLAMA_HTTP) {
+            return@withContext queryOllamaServer(prompt)
+        }
+
         mutex.withLock {
             if (_status.value !is ModelStatus.Ready) {
-                return@withContext "Error: Model is not loaded into memory. Please load a model first."
+                // If GGUF is not loaded, attempt Ollama server fallback if available
+                val ollamaResult = queryOllamaServer(prompt)
+                if (!ollamaResult.startsWith("Error connecting")) {
+                    return@withContext ollamaResult
+                }
+                return@withContext "Error: Model is not loaded into memory. Please load a GGUF model or select Ollama server mode."
             }
             try {
-                Log.i(TAG, "Triggering native generation...")
+                Log.i(TAG, "Triggering native generation with context length: $contextLengthTokens...")
                 nativeGenerate(prompt)
             } catch (e: Exception) {
                 Log.e(TAG, "Exception during native generation", e)
                 "Error during LLM generation: ${e.localizedMessage}"
             }
+        }
+    }
+
+    suspend fun testOllamaConnection(): String = withContext(Dispatchers.IO) {
+        try {
+            val endpoint = "${ollamaHost.trimEnd('/')}/api/tags"
+            val url = URL(endpoint)
+            val connection = url.openConnection() as HttpURLConnection
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 3000
+            connection.readTimeout = 3000
+            val code = connection.responseCode
+            if (code == 200) {
+                val text = connection.inputStream.bufferedReader().use { it.readText() }
+                "✅ Connected to Ollama at $ollamaHost! Server active.\nResponse: $text"
+            } else {
+                "⚠️ Ollama server returned HTTP code $code"
+            }
+        } catch (e: Exception) {
+            "❌ Could not connect to $ollamaHost: ${e.localizedMessage}"
+        }
+    }
+
+    private fun queryOllamaServer(prompt: String): String {
+        return try {
+            val endpoint = "${ollamaHost.trimEnd('/')}/api/generate"
+            val url = URL(endpoint)
+            val connection = url.openConnection() as HttpURLConnection
+            connection.requestMethod = "POST"
+            connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+            connection.connectTimeout = 10000
+            connection.readTimeout = 90000
+            connection.doOutput = true
+
+            val escapedPrompt = prompt
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t")
+
+            val jsonPayload = """
+                {
+                  "model": "$ollamaModelName",
+                  "prompt": "$escapedPrompt",
+                  "stream": false,
+                  "options": {
+                    "num_ctx": $contextLengthTokens
+                  }
+                }
+            """.trimIndent()
+
+            connection.outputStream.use { os ->
+                os.write(jsonPayload.toByteArray(Charsets.UTF_8))
+            }
+
+            val responseCode = connection.responseCode
+            if (responseCode == 200) {
+                val responseText = connection.inputStream.bufferedReader().use { it.readText() }
+                parseOllamaJsonResponse(responseText)
+            } else {
+                val errText = connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                "Error connecting to Ollama ($responseCode): $errText"
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Ollama connection error", e)
+            "Error connecting to Ollama at $ollamaHost: ${e.localizedMessage}. Ensure Ollama is running with model '$ollamaModelName'."
+        }
+    }
+
+    private fun parseOllamaJsonResponse(json: String): String {
+        return try {
+            val key = "\"response\":\""
+            val startIdx = json.indexOf(key)
+            if (startIdx != -1) {
+                val contentStart = startIdx + key.length
+                var i = contentStart
+                val sb = StringBuilder()
+                var escaped = false
+                while (i < json.length) {
+                    val c = json[i]
+                    if (escaped) {
+                        when (c) {
+                            'n' -> sb.append('\n')
+                            'r' -> sb.append('\r')
+                            't' -> sb.append('\t')
+                            '"' -> sb.append('"')
+                            '\\' -> sb.append('\\')
+                            else -> sb.append(c)
+                        }
+                        escaped = false
+                    } else if (c == '\\') {
+                        escaped = true
+                    } else if (c == '"') {
+                        break
+                    } else {
+                        sb.append(c)
+                    }
+                    i++
+                }
+                sb.toString()
+            } else {
+                json
+            }
+        } catch (e: Exception) {
+            json
         }
     }
 
@@ -140,7 +267,10 @@ object LlmEngine {
     }
 
     fun isReady(): Boolean {
-        return _status.value is ModelStatus.Ready
+        return when (engineType) {
+            LlmEngineType.GGUF_NATIVE -> _status.value is ModelStatus.Ready
+            LlmEngineType.OLLAMA_HTTP -> true
+        }
     }
 
     private fun getFileNameFromUri(context: Context, uri: Uri): String? {

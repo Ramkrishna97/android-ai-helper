@@ -52,6 +52,11 @@ class FloatingOverlayService : Service() {
 
     private var projectionData: Intent? = null
     private var mediaProjection: MediaProjection? = null
+    private var activeVirtualDisplay: VirtualDisplay? = null
+    private var activeImageReader: ImageReader? = null
+    private var captureWidth = 0
+    private var captureHeight = 0
+    private var captureDensity = 0
 
     private var lastCapturedOcrText: String = ""
     private val chatMessagesHtml = mutableListOf<String>()
@@ -96,37 +101,71 @@ class FloatingOverlayService : Service() {
         removeFloatingBubble()
         removeKillDropZone()
         removeResultPopup()
-        try {
-            mediaProjection?.stop()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping MediaProjection", e)
-        }
-        mediaProjection = null
+        stopCapturePipeline()
     }
 
     private fun initMediaProjection(intentData: Intent) {
         try {
-            if (mediaProjection != null) {
-                try {
-                    mediaProjection?.stop()
-                } catch (_: Exception) {}
-            }
+            stopCapturePipeline()
 
             val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             mediaProjection = projectionManager.getMediaProjection(Activity.RESULT_OK, intentData)
 
             mediaProjection?.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() {
-                    Log.i(TAG, "MediaProjection session stopped")
-                    mediaProjection = null
+                    Log.i(TAG, "MediaProjection session stopped by OS")
+                    stopCapturePipeline()
                 }
             }, Handler(Looper.getMainLooper()))
 
-            Log.i(TAG, "MediaProjection initialized successfully")
+            setupPersistentVirtualDisplay()
+
+            Log.i(TAG, "MediaProjection & VirtualDisplay initialized successfully")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize MediaProjection from intent data", e)
             mediaProjection = null
         }
+    }
+
+    private fun setupPersistentVirtualDisplay() {
+        val proj = mediaProjection ?: return
+
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(metrics)
+        captureWidth = metrics.widthPixels
+        captureHeight = metrics.heightPixels
+        captureDensity = metrics.densityDpi
+
+        try {
+            activeImageReader?.close()
+            activeVirtualDisplay?.release()
+
+            activeImageReader = ImageReader.newInstance(captureWidth, captureHeight, PixelFormat.RGBA_8888, 2)
+            activeVirtualDisplay = proj.createVirtualDisplay(
+                "PersistentScreenCapture",
+                captureWidth,
+                captureHeight,
+                captureDensity,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                activeImageReader?.surface,
+                null,
+                Handler(Looper.getMainLooper())
+            )
+            Log.i(TAG, "Persistent VirtualDisplay created (${captureWidth}x${captureHeight})")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create persistent VirtualDisplay", e)
+            stopCapturePipeline()
+        }
+    }
+
+    private fun stopCapturePipeline() {
+        try { activeVirtualDisplay?.release() } catch (_: Exception) {}
+        try { activeImageReader?.close() } catch (_: Exception) {}
+        try { mediaProjection?.stop() } catch (_: Exception) {}
+        activeVirtualDisplay = null
+        activeImageReader = null
+        mediaProjection = null
     }
 
     private fun createNotificationChannel() {
@@ -354,92 +393,106 @@ class FloatingOverlayService : Service() {
 
     private fun onFloatingBubbleClicked() {
         if (!LlmEngine.isReady()) {
-            Toast.makeText(this, "Please load a GGUF model into RAM first!", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Please load a GGUF model or select Ollama mode first!", Toast.LENGTH_SHORT).show()
             return
         }
 
-        if (mediaProjection == null && projectionData != null) {
-            try {
-                val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                mediaProjection = projectionManager.getMediaProjection(Activity.RESULT_OK, projectionData!!)
-            } catch (e: Exception) {
-                Log.e(TAG, "Recreating MediaProjection from intent failed", e)
-                mediaProjection = null
+        // Hide result popup overlay first so it is NOT captured in the screenshot!
+        removeResultPopup()
+
+        // Delay slightly (250ms) to allow WindowManager to remove popup overlay before capturing screen
+        Handler(Looper.getMainLooper()).postDelayed({
+            captureScreenAndProcess()
+        }, 250)
+    }
+
+    private fun captureScreenAndProcess() {
+        if (mediaProjection == null || activeVirtualDisplay == null || activeImageReader == null) {
+            if (projectionData != null) {
+                try {
+                    val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                    mediaProjection = projectionManager.getMediaProjection(Activity.RESULT_OK, projectionData!!)
+                    setupPersistentVirtualDisplay()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Recreating MediaProjection from intent failed", e)
+                    mediaProjection = null
+                }
             }
         }
 
-        if (mediaProjection == null) {
-            Log.i(TAG, "MediaProjection is null. Requesting user permission transparently...")
+        if (mediaProjection == null || activeImageReader == null) {
+            Log.i(TAG, "MediaProjection session inactive. Launching CapturePermissionActivity...")
             val intent = Intent(this, CapturePermissionActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NO_ANIMATION)
             }
             startActivity(intent)
             return
         }
 
-        captureScreenAndProcess()
-    }
+        val reader = activeImageReader ?: return
 
-    private fun captureScreenAndProcess() {
-        if (mediaProjection == null) {
-            showResultPopup("MediaProjection session inactive. Tap Recapture to re-authorize.")
-            return
-        }
-
+        // Check if screen metrics changed (e.g. rotation)
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
         windowManager.defaultDisplay.getRealMetrics(metrics)
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val density = metrics.densityDpi
-
-        showResultPopup("📸 Capturing screen & running hardware OCR transcompilation...")
-
-        val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        var virtualDisplay: VirtualDisplay? = null
-
-        try {
-            virtualDisplay = mediaProjection?.createVirtualDisplay(
-                "ScreenCapture",
-                width,
-                height,
-                density,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                imageReader.surface,
-                null,
-                Handler(Looper.getMainLooper())
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Error creating VirtualDisplay", e)
-            imageReader.close()
-            mediaProjection = null
-            showResultPopup("Screen capture session expired. Please tap Recapture.")
-            return
+        if (metrics.widthPixels != captureWidth || metrics.heightPixels != captureHeight) {
+            setupPersistentVirtualDisplay()
         }
 
-        Handler(Looper.getMainLooper()).postDelayed({
+        var image: Image? = null
+        try {
+            image = reader.acquireLatestImage()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error acquiring latest image", e)
+        }
+
+        if (image != null) {
             try {
-                val image = imageReader.acquireLatestImage()
-                if (image != null) {
-                    val bitmap = imageToBitmap(image, width, height)
-                    image.close()
+                val bitmap = imageToBitmap(image, captureWidth, captureHeight)
+                image.close()
+                runOcrAndLlm(bitmap)
+                return
+            } catch (e: Exception) {
+                Log.e(TAG, "Error processing acquired image", e)
+                image.close()
+            }
+        }
 
-                    virtualDisplay?.release()
-                    imageReader.close()
-
+        // If latest image was null, attach listener for the very next frame
+        var captured = false
+        reader.setOnImageAvailableListener({ r ->
+            if (captured) return@setOnImageAvailableListener
+            try {
+                val img = r.acquireLatestImage() ?: r.acquireNextImage()
+                if (img != null) {
+                    captured = true
+                    r.setOnImageAvailableListener(null, null)
+                    val bitmap = imageToBitmap(img, captureWidth, captureHeight)
+                    img.close()
                     runOcrAndLlm(bitmap)
-                } else {
-                    virtualDisplay?.release()
-                    imageReader.close()
-                    showResultPopup("Could not capture frame buffer. Please try tapping again.")
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error processing frame buffer", e)
-                try { virtualDisplay?.release() } catch (_: Exception) {}
-                try { imageReader.close() } catch (_: Exception) {}
-                showResultPopup("Frame processing error: ${e.localizedMessage}")
+                Log.e(TAG, "Error acquiring image in listener", e)
             }
-        }, 350)
+        }, Handler(Looper.getMainLooper()))
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (!captured) {
+                reader.setOnImageAvailableListener(null, null)
+                try {
+                    val img = reader.acquireLatestImage() ?: reader.acquireNextImage()
+                    if (img != null) {
+                        captured = true
+                        val bitmap = imageToBitmap(img, captureWidth, captureHeight)
+                        img.close()
+                        runOcrAndLlm(bitmap)
+                        return@postDelayed
+                    }
+                } catch (_: Exception) {}
+
+                showResultPopup("Could not capture screen frame. Please tap Recapture again.")
+            }
+        }, 800)
     }
 
     private fun imageToBitmap(image: Image, width: Int, height: Int): Bitmap {
@@ -466,35 +519,49 @@ class FloatingOverlayService : Service() {
             .addOnSuccessListener { visionText ->
                 val extractedText = visionText.text
                 lastCapturedOcrText = extractedText
+                Log.i(TAG, "OCR Extracted ${extractedText.length} characters:\n$extractedText")
                 chatMessagesHtml.clear()
 
                 if (extractedText.isBlank()) {
-                    val msg = "<b>[Hardware OCR Transcompilation]</b>: No text detected on screen. (Using fallback text prompt)"
-                    lastCapturedOcrText = "General screen content (No text blocks found via hardware OCR)."
+                    val msg = "<b>[Screen OCR]</b>: No text detected on screen."
+                    lastCapturedOcrText = "General screen content (No text blocks found via OCR)."
                     chatMessagesHtml.add(msg)
                     showResultPopup(msg)
                 } else {
-                    val badge = "<b>[Hardware OCR Transcompilation Active]</b>: Converted screen image to text (${extractedText.length} chars) for text-only LLM."
+                    val badge = "<b>[Screen OCR Active]</b>: Converted screen image to text (${extractedText.length} chars) for LLM."
                     chatMessagesHtml.add(badge)
-                    showResultPopup(badge + "\n\nGenerating local LLM troubleshooting response...")
+
+                    val thinkingMsg = "<b><font color='#34D399'>AI Assistant:</font></b> <i>Analyzing screen context...</i>"
+                    chatMessagesHtml.add(thinkingMsg)
+
+                    showResultPopup(badge)
 
                     val prompt = """
-                        Analyze the following text captured from a user's screen. Identify any errors, problems, or things they might be trying to solve, and give a concise overview with actionable steps:
-
+                        Captured Screen Context:
                         $extractedText
                     """.trimIndent()
 
                     serviceScope.launch {
                         val response = LlmEngine.generate(prompt)
-                        chatMessagesHtml.add(response)
-                        showResultPopup(response)
+                        if (chatMessagesHtml.isNotEmpty() && chatMessagesHtml.last() == thinkingMsg) {
+                            chatMessagesHtml.removeAt(chatMessagesHtml.size - 1)
+                        }
+                        val aiResponseHtml = "<b><font color='#34D399'>AI Assistant:</font></b><br/>" + response
+                        chatMessagesHtml.add(aiResponseHtml)
+
+                        if (resultPopupView != null) {
+                            renderChatPopupContent()
+                        } else {
+                            showResultPopup(aiResponseHtml)
+                        }
                     }
                 }
             }
             .addOnFailureListener { e ->
                 Log.e(TAG, "OCR recognition failed", e)
-                val msg = "<b>[OCR Fallback]</b>: Hardware text recognition failed: ${e.localizedMessage}. Processing raw screen context."
+                val msg = "<b>[OCR Fallback]</b>: Text recognition failed: ${e.localizedMessage}."
                 lastCapturedOcrText = "Screen capture acquired. OCR failure: ${e.localizedMessage}"
+                chatMessagesHtml.clear()
                 chatMessagesHtml.add(msg)
                 showResultPopup(msg)
             }
@@ -526,7 +593,7 @@ class FloatingOverlayService : Service() {
         renderChatPopupContent()
 
         val prompt = """
-            Context from captured screen text:
+            Captured Screen Context:
             $lastCapturedOcrText
 
             User query: $userQuestion

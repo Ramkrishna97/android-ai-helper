@@ -30,8 +30,12 @@ import androidx.compose.ui.unit.sp
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.lifecycleScope
 import com.example.ai_app1.llm.LlmEngine
+import com.example.ai_app1.llm.LlmEngineType
 import com.example.ai_app1.llm.ModelStatus
 import com.example.ai_app1.service.FloatingOverlayService
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -203,11 +207,53 @@ fun DashboardScreen(
     var downloadProgress by remember { mutableStateOf(0f) }
     var downloadStatusText by remember { mutableStateOf("") }
 
+    // LLM Engine Settings State
+    var engineTypeState by remember { mutableStateOf(LlmEngine.engineType) }
+    var ollamaHostState by remember { mutableStateOf(LlmEngine.ollamaHost) }
+    var ollamaModelNameState by remember { mutableStateOf(LlmEngine.ollamaModelName) }
+    var contextLengthState by remember { mutableStateOf(LlmEngine.contextLengthTokens.toFloat()) }
+    var ollamaTestResult by remember { mutableStateOf("") }
+    var isTestingOllama by remember { mutableStateOf(false) }
+
     // Live RAM updates
     LaunchedEffect(Unit) {
         while (true) {
             ramInfo = LlmEngine.getSystemRamInfo(context)
             delay(1000)
+        }
+    }
+
+    var selectedImageUri by remember { mutableStateOf<Uri?>(null) }
+    var ocrResultText by remember { mutableStateOf("") }
+    var isOcrProcessing by remember { mutableStateOf(false) }
+
+    val imageOcrPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            selectedImageUri = uri
+            isOcrProcessing = true
+            ocrResultText = "Processing OCR..."
+            try {
+                val inputImage = InputImage.fromFilePath(context, uri)
+                val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                recognizer.process(inputImage)
+                    .addOnSuccessListener { visionText ->
+                        isOcrProcessing = false
+                        ocrResultText = if (visionText.text.isBlank()) {
+                            "No text found in the selected image."
+                        } else {
+                            visionText.text
+                        }
+                    }
+                    .addOnFailureListener { e ->
+                        isOcrProcessing = false
+                        ocrResultText = "OCR Failed: ${e.localizedMessage}"
+                    }
+            } catch (e: Exception) {
+                isOcrProcessing = false
+                ocrResultText = "Error processing image: ${e.localizedMessage}"
+            }
         }
     }
 
@@ -329,7 +375,6 @@ fun DashboardScreen(
                     color = MaterialTheme.colorScheme.primary
                 )
 
-                // Select Download Location Button
                 OutlinedButton(
                     onClick = { folderPickerLauncher.launch(null) },
                     modifier = Modifier.fillMaxWidth()
@@ -438,50 +483,6 @@ fun DashboardScreen(
                             enabled = !isDownloading
                         ) {
                             Text(text = "Download Qwen2-VL-2B (~1.6GB)", fontSize = 11.sp)
-                        }
-                    }
-                }
-
-                // Model 3: MiniCPM-V-2_6 2B Vision (~1.8GB)
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        Text(text = "👁️ MiniCPM-V-2_6 2B Vision (Q4 GGUF)", fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                        Text(text = "Size: ~1.8 GB | Edge vision-language model for on-device screen analysis.", fontSize = 11.sp, color = Color.Gray)
-                        Text(text = "HuggingFace: openbmb/MiniCPM-V-2_6-gguf", fontSize = 10.sp, color = MaterialTheme.colorScheme.primary)
-
-                        Button(
-                            onClick = {
-                                isDownloading = true
-                                downloadStatusText = "Downloading MiniCPM-V-2_6..."
-                                downloadModelFromUrl(
-                                    context = context,
-                                    fileUrl = "https://huggingface.co/openbmb/MiniCPM-V-2_6-gguf/resolve/main/ggml-model-Q4_K_M.gguf",
-                                    customFolderUri = customFolderUri,
-                                    onProgress = { prog, status ->
-                                        downloadProgress = prog
-                                        downloadStatusText = status
-                                    },
-                                    onComplete = { uri ->
-                                        isDownloading = false
-                                        if (uri != null) {
-                                            onSelectFile(uri)
-                                            Toast.makeText(context, "MiniCPM-V downloaded successfully!", Toast.LENGTH_LONG).show()
-                                        } else {
-                                            Toast.makeText(context, "Download failed", Toast.LENGTH_SHORT).show()
-                                        }
-                                    }
-                                )
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            enabled = !isDownloading
-                        ) {
-                            Text(text = "Download MiniCPM-V (~1.8GB)", fontSize = 11.sp)
                         }
                     }
                 }
@@ -646,6 +647,134 @@ fun DashboardScreen(
             }
         }
 
+        // Section 2.5: LLM Engine & Context Length Settings
+        ElevatedCard(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "⚙️ LLM Engine & Context Window Settings",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+
+                Text(
+                    text = "Execution Mode:",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilterChip(
+                        selected = engineTypeState == LlmEngineType.GGUF_NATIVE,
+                        onClick = {
+                            engineTypeState = LlmEngineType.GGUF_NATIVE
+                            LlmEngine.engineType = LlmEngineType.GGUF_NATIVE
+                        },
+                        label = { Text("Native GGUF Model", fontSize = 11.sp) },
+                        modifier = Modifier.weight(1f)
+                    )
+
+                    FilterChip(
+                        selected = engineTypeState == LlmEngineType.OLLAMA_HTTP,
+                        onClick = {
+                            engineTypeState = LlmEngineType.OLLAMA_HTTP
+                            LlmEngine.engineType = LlmEngineType.OLLAMA_HTTP
+                        },
+                        label = { Text("Ollama API (gemma3:1b)", fontSize = 11.sp) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
+
+                Text(
+                    text = "🧠 LLM Context Length: ${contextLengthState.toInt()} tokens",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = "Allows processing long text / entire page context without truncation.",
+                    fontSize = 11.sp,
+                    color = Color.Gray
+                )
+
+                Slider(
+                    value = contextLengthState,
+                    onValueChange = {
+                        contextLengthState = it
+                        LlmEngine.contextLengthTokens = it.toInt()
+                    },
+                    valueRange = 1024f..8192f,
+                    steps = 6
+                )
+
+                if (engineTypeState == LlmEngineType.OLLAMA_HTTP) {
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
+
+                    Text(
+                        text = "🦙 Ollama Local Server Connection",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.secondary
+                    )
+
+                    OutlinedTextField(
+                        value = ollamaHostState,
+                        onValueChange = {
+                            ollamaHostState = it
+                            LlmEngine.ollamaHost = it
+                        },
+                        label = { Text("Ollama Host URL") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+
+                    OutlinedTextField(
+                        value = ollamaModelNameState,
+                        onValueChange = {
+                            ollamaModelNameState = it
+                            LlmEngine.ollamaModelName = it
+                        },
+                        label = { Text("Model Name (e.g., gemma3:1b)") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+
+                    Button(
+                        onClick = {
+                            isTestingOllama = true
+                            ollamaTestResult = "Connecting to $ollamaHostState..."
+                            scope.launch {
+                                ollamaTestResult = LlmEngine.testOllamaConnection()
+                                isTestingOllama = false
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !isTestingOllama
+                    ) {
+                        Text(text = "Test Connection to Ollama", fontSize = 12.sp)
+                    }
+
+                    if (ollamaTestResult.isNotBlank()) {
+                        Text(
+                            text = ollamaTestResult,
+                            fontSize = 11.sp,
+                            color = if (ollamaTestResult.startsWith("✅")) Color(0xFF2E7D32) else Color.Red
+                        )
+                    }
+                }
+            }
+        }
+
         // Section 3: Capture Mode Configuration
         ElevatedCard(
             modifier = Modifier.fillMaxWidth(),
@@ -697,6 +826,65 @@ fun DashboardScreen(
             }
         }
 
+        // Section 3.5: Image & Screenshot OCR (Google ML Kit)
+        ElevatedCard(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "3.5 Image & Screenshot OCR",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "Pick any image or screenshot from device storage to extract text using Google ML Kit.",
+                    fontSize = 12.sp,
+                    color = Color.Gray
+                )
+
+                Button(
+                    onClick = { imageOcrPickerLauncher.launch("image/*") },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(text = "Pick Image/Screenshot for OCR")
+                }
+
+                if (isOcrProcessing) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(text = "Recognizing text...", fontSize = 13.sp)
+                    }
+                }
+
+                if (ocrResultText.isNotBlank()) {
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                    Text(
+                        text = "Extracted OCR Text:",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    OutlinedCard(
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = ocrResultText,
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(12.dp)
+                        )
+                    }
+                }
+            }
+        }
+
         // Section 4: Launch Floating Assistant
         ElevatedCard(
             modifier = Modifier.fillMaxWidth(),
@@ -715,7 +903,7 @@ fun DashboardScreen(
                 Button(
                     onClick = {
                         if (!LlmEngine.isReady()) {
-                            Toast.makeText(context, "Please load a model into RAM first", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "Please load a model or select Ollama mode first", Toast.LENGTH_SHORT).show()
                             return@Button
                         }
 
@@ -731,7 +919,7 @@ fun DashboardScreen(
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
-                    enabled = modelStatus is ModelStatus.Ready,
+                    enabled = (modelStatus is ModelStatus.Ready || engineTypeState == LlmEngineType.OLLAMA_HTTP),
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary)
                 ) {
                     Text(text = "Start Floating Helper (One-Time Consent)")
